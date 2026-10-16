@@ -81,7 +81,7 @@ final class TrackingPreviewView: UIView {
     }
     private func pick(_ rect: CGRect) {
         let clipped = rect.intersection(bounds)
-        guard clipped.width >= 6, clipped.height >= 6 else { return }
+        guard clipped.width >= 12, clipped.height >= 12 else { return }
         let meta = previewLayer.metadataOutputRectConverted(fromLayerRect: clipped)
         let bounded = meta.intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
         guard bounded.width > 0.01, bounded.height > 0.01 else { return }
@@ -89,7 +89,7 @@ final class TrackingPreviewView: UIView {
     }
     @objc private func didTap(_ gesture: UITapGestureRecognizer) {
         let p = gesture.location(in: self)
-        let side = min(bounds.width, bounds.height) * 0.22
+        let side = min(bounds.width, bounds.height) * 0.16
         pick(CGRect(x: p.x - side / 2, y: p.y - side / 2, width: side, height: side))
     }
     @objc private func didPan(_ gesture: UIPanGestureRecognizer) {

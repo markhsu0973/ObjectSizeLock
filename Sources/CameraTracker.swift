@@ -25,6 +25,13 @@ final class CameraTracker: NSObject, ObservableObject {
     private var lastZoomUpdate: CFTimeInterval = 0
     private var lastDisplayUpdate: CFTimeInterval = 0
     private var zoomEnabled = true
+    private var lastAcceptedBox: CGRect?
+    private var lastAcceptedTime: CFTimeInterval = 0
+    private var stableFrames = 0
+    private var zoomSettlingUntil: CFTimeInterval = 0
+    private var confidenceFailures = 0
+    // Conservative initial limit; can be raised after real-device validation.
+    private let safetyZoomLimit: CGFloat = 3.0
 
     func start() {
         AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
@@ -94,7 +101,12 @@ final class CameraTracker: NSObject, ObservableObject {
             self.request = tracker
             self.sequence = VNSequenceRequestHandler()
             self.baselineArea = max(visionBox.width * visionBox.height, 0.0001)
-            self.lastZoomUpdate = 0
+            self.lastZoomUpdate = CACurrentMediaTime()
+            self.zoomSettlingUntil = CACurrentMediaTime() + 0.5
+            self.stableFrames = 0
+            self.confidenceFailures = 0
+            self.lastAcceptedBox = visionBox
+            self.lastAcceptedTime = CACurrentMediaTime()
             DispatchQueue.main.async {
                 self.trackingRect = metadataRect
                 self.status = "正在追蹤（原始大小已鎖定）"
@@ -106,6 +118,9 @@ final class CameraTracker: NSObject, ObservableObject {
         videoQueue.async {
             self.request = nil
             self.baselineArea = 0
+            self.lastAcceptedBox = nil
+            self.stableFrames = 0
+            self.confidenceFailures = 0
             DispatchQueue.main.async {
                 self.trackingRect = nil
                 self.status = "請重新點選或框選物件"
@@ -138,27 +153,54 @@ final class CameraTracker: NSObject, ObservableObject {
         }
     }
 
-    private func updateZoom(measuredArea: CGFloat) {
-        let now = CACurrentMediaTime()
-        guard now - lastZoomUpdate >= 0.25,
+    private func updateZoom(measuredArea: CGFloat, now: CFTimeInterval) {
+        guard now >= zoomSettlingUntil,
+              now - lastZoomUpdate >= 0.85,
+              stableFrames >= 8,
               let device = camera, baselineArea > 0,
-              measuredArea > 0.00001 else { return }
-        lastZoomUpdate = now
-        let scaleRatio = sqrt(baselineArea / measuredArea)
-        if abs(log(scaleRatio)) < 0.075 { return } // 7.5% log dead band
+              measuredArea > 0.0001 else { return }
+
+        // The Vision bounding box already includes optical/digital zoom. Use
+        // sqrt of the area ratio but apply only a small proportional correction.
+        let relativeSizeError = sqrt(baselineArea / measuredArea)
+        guard relativeSizeError.isFinite,
+              relativeSizeError > 0.0,
+              abs(log(relativeSizeError)) >= 0.15 else { return }
+
         let current = device.videoZoomFactor
-        // Partial proportional correction prevents zoom oscillations.
-        let newZoom = current * pow(scaleRatio, 0.32)
-        let maxZoom = min(CGFloat(8), device.activeFormat.videoMaxZoomFactor,
+        let maxZoom = min(safetyZoomLimit, device.activeFormat.videoMaxZoomFactor,
                           device.maxAvailableVideoZoomFactor)
-        let next = min(maxZoom, max(device.minAvailableVideoZoomFactor, newZoom))
-        guard abs(next - current) > 0.04 else { return }
+        let minZoom = max(CGFloat(1), device.minAvailableVideoZoomFactor)
+        guard maxZoom >= minZoom else { return }
+
+        // Bound a single correction to +/- 8% regardless of tracking-box noise.
+        let correction = min(CGFloat(1.08), max(CGFloat(0.92), pow(relativeSizeError, 0.18)))
+        let desired = min(maxZoom, max(minZoom, current * correction))
+        guard abs(desired - current) >= 0.035 else { return }
         do {
             try device.lockForConfiguration()
-            device.ramp(toVideoZoomFactor: next, withRate: 0.65)
+            device.ramp(toVideoZoomFactor: desired, withRate: 0.35)
             device.unlockForConfiguration()
-        } catch { /* A competing camera configuration can temporarily prevent zoom changes. */ }
+            lastZoomUpdate = now
+            zoomSettlingUntil = now + 1.25
+            stableFrames = 0
+        } catch {
+            lastZoomUpdate = now
+        }
     }
+
+    private func loseTarget(_ message: String) {
+        request = nil
+        baselineArea = 0
+        lastAcceptedBox = nil
+        stableFrames = 0
+        confidenceFailures = 0
+        DispatchQueue.main.async {
+            self.trackingRect = nil
+            self.status = message
+        }
+    }
+
 }
 
 extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
@@ -169,19 +211,43 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
             // Back camera, portrait preview. Check orientation on specific devices.
             try sequence.perform([request], on: buffer, orientation: .right)
             guard let observation = request.results?.first as? VNDetectedObjectObservation,
-                  observation.confidence >= 0.35 else {
-                self.request = nil
-                DispatchQueue.main.async {
-                    self.trackingRect = nil
-                    self.status = "目標遺失，請重新框選"
+                  observation.confidence >= 0.55 else {
+                confidenceFailures += 1
+                stableFrames = 0
+                if confidenceFailures >= 3 {
+                    loseTarget("目標遺失，已停止自動變焦，請重新框選")
                 }
                 return
             }
-            request.inputObservation = observation
+            confidenceFailures = 0
             let box = observation.boundingBox
+            let now = CACurrentMediaTime()
+            let area = box.width * box.height
+            guard box.width > 0.025, box.height > 0.025,
+                  box.minX >= 0, box.minY >= 0,
+                  box.maxX <= 1, box.maxY <= 1,
+                  area.isFinite else {
+                loseTarget("追蹤框異常，已停止變焦，請重新框選")
+                return
+            }
+            if let previous = lastAcceptedBox {
+                let oldArea = previous.width * previous.height
+                let areaRatio = area / max(oldArea, 0.0001)
+                let centerJump = hypot(box.midX - previous.midX, box.midY - previous.midY)
+                // Reject sudden drift onto the background or a different object.
+                if areaRatio < 0.52 || areaRatio > 1.9 || centerJump > 0.24 {
+                    loseTarget("追蹤位置突變，已停止變焦，請重新框選")
+                    return
+                }
+            }
+            request.inputObservation = observation
+            lastAcceptedBox = box
+            lastAcceptedTime = now
+            if now >= zoomSettlingUntil { stableFrames += 1 }
+            else { stableFrames = 0 }
+
             let metadataBox = CGRect(x: box.minX, y: 1 - box.maxY,
                                      width: box.width, height: box.height)
-            let now = CACurrentMediaTime()
             if now - lastDisplayUpdate >= 0.1 {
                 lastDisplayUpdate = now
                 let currentZoom = camera?.videoZoomFactor ?? 1
@@ -190,11 +256,9 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
                     self.zoom = currentZoom
                 }
             }
-            // Access main-thread UI setting without changing the vision queue's tracking state.
-            if zoomEnabled { updateZoom(measuredArea: box.width * box.height) }
+            if zoomEnabled { updateZoom(measuredArea: area, now: now) }
         } catch {
-            self.request = nil
-            DispatchQueue.main.async { self.status = "追蹤失敗，請重新框選" }
+            loseTarget("追蹤失敗，已停止變焦，請重新框選")
         }
     }
 }
