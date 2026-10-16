@@ -1,0 +1,34 @@
+name: Build unsigned iPhone IPA
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate Xcode project
+        run: xcodegen generate
+      - name: Build unsigned device app
+        run: |
+          xcodebuild -project ObjectSizeLock.xcodeproj \
+            -scheme ObjectSizeLock -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/build" \
+            CODE_SIGNING_ALLOWED=NO build
+      - name: Pack unsigned IPA (requires local signing to install)
+        run: |
+          mkdir -p Payload
+          cp -R "$RUNNER_TEMP/build/Build/Products/Release-iphoneos/ObjectSizeLock.app" Payload/
+          zip -q -r ObjectSizeLock-unsigned.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ObjectSizeLock-unsigned-IPA
+          path: ObjectSizeLock-unsigned.ipa
+          if-no-files-found: error
