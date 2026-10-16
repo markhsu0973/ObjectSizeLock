@@ -31,7 +31,7 @@ struct ContentView: View {
                 .controlSize(.regular)
                 .padding(12)
                 .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 12))
-                Text("點一下選取物件，或拖曳框選更準確。選取瞬間的大小會成為目標大小。")
+                Text("請拖曳框選整個物件（不要包含手或背景）。先觀察綠框是否穩定，再開啟自動縮放。")
                     .font(.caption)
                     .multilineTextAlignment(.center)
                     .padding(.horizontal, 14)
@@ -50,6 +50,7 @@ final class TrackingPreviewView: UIView {
     override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
     var previewLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
     private let targetLayer = CAShapeLayer()
+    private let selectionLayer = CAShapeLayer()
     private var target: CGRect?
     var onSelection: ((CGRect) -> Void)?
     private var dragStart: CGPoint?
@@ -60,7 +61,10 @@ final class TrackingPreviewView: UIView {
         targetLayer.fillColor = UIColor.clear.cgColor
         targetLayer.lineWidth = 2.5
         layer.addSublayer(targetLayer)
-        addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(didTap(_:))))
+        selectionLayer.strokeColor = UIColor.systemYellow.cgColor
+        selectionLayer.fillColor = UIColor.systemYellow.withAlphaComponent(0.12).cgColor
+        selectionLayer.lineWidth = 2
+        layer.addSublayer(selectionLayer)
         let pan = UIPanGestureRecognizer(target: self, action: #selector(didPan(_:)))
         addGestureRecognizer(pan)
     }
@@ -68,6 +72,7 @@ final class TrackingPreviewView: UIView {
     override func layoutSubviews() {
         super.layoutSubviews()
         targetLayer.frame = bounds
+        selectionLayer.frame = bounds
         redrawTarget()
     }
     func show(_ normalizedRect: CGRect?) {
@@ -87,20 +92,26 @@ final class TrackingPreviewView: UIView {
         guard bounded.width > 0.01, bounded.height > 0.01 else { return }
         onSelection?(bounded)
     }
-    @objc private func didTap(_ gesture: UITapGestureRecognizer) {
-        let p = gesture.location(in: self)
-        let side = min(bounds.width, bounds.height) * 0.16
-        pick(CGRect(x: p.x - side / 2, y: p.y - side / 2, width: side, height: side))
-    }
     @objc private func didPan(_ gesture: UIPanGestureRecognizer) {
         let current = gesture.location(in: self)
         switch gesture.state {
-        case .began: dragStart = current
-        case .ended:
+        case .began:
+            dragStart = current
+        case .changed:
             guard let start = dragStart else { return }
+            let rect = CGRect(x: min(start.x, current.x), y: min(start.y, current.y),
+                              width: abs(current.x - start.x), height: abs(current.y - start.y))
+            selectionLayer.path = UIBezierPath(rect: rect).cgPath
+        case .ended:
+            defer { selectionLayer.path = nil; dragStart = nil }
+            guard let start = dragStart else { return }
+            let rect = CGRect(x: min(start.x, current.x), y: min(start.y, current.y),
+                              width: abs(current.x - start.x), height: abs(current.y - start.y))
+            guard rect.width >= 45, rect.height >= 45 else { return }
+            pick(rect)
+        case .cancelled, .failed:
+            selectionLayer.path = nil
             dragStart = nil
-            pick(CGRect(x: min(start.x, current.x), y: min(start.y, current.y),
-                        width: abs(current.x - start.x), height: abs(current.y - start.y)))
         default: break
         }
     }
