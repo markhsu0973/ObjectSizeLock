@@ -34,6 +34,15 @@ final class CameraTracker: NSObject, ObservableObject {
     private var smoothedArea: CGFloat?
     // Conservative initial limit; can be raised after real-device validation.
     private let safetyZoomLimit: CGFloat = 3.0
+    // The selected target is verified against a frozen, brightness-normalized
+    // image patch, so a high Vision confidence alone cannot approve tracking.
+    private var referencePatch: [Float]?
+    private var pendingSelection: CGRect?
+    private var appearanceFailures = 0
+    private var trackingValidated = false
+    private var latestSampleTime: CFTimeInterval = 0
+    private let minimumSimilarity: Float = 0.60
+
 
     func start() {
         AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
@@ -102,6 +111,10 @@ final class CameraTracker: NSObject, ObservableObject {
             tracker.trackingLevel = .accurate
             self.request = tracker
             self.sequence = VNSequenceRequestHandler()
+            self.pendingSelection = visionBox
+            self.referencePatch = nil
+            self.trackingValidated = false
+            self.appearanceFailures = 0
             self.baselineArea = max(visionBox.width * visionBox.height, 0.0001)
             self.lastZoomUpdate = CACurrentMediaTime()
             self.zoomSettlingUntil = CACurrentMediaTime() + 0.5
@@ -121,6 +134,9 @@ final class CameraTracker: NSObject, ObservableObject {
     func resetTracking() {
         videoQueue.async {
             self.request = nil
+            self.pendingSelection = nil
+            self.referencePatch = nil
+            self.trackingValidated = false
             self.baselineArea = 0
             self.lastAcceptedBox = nil
             self.stableFrames = 0
@@ -197,8 +213,69 @@ final class CameraTracker: NSObject, ObservableObject {
         }
     }
 
+    // Sample a brightness-normalized 24x24 thumbnail directly from the
+    // camera Y plane. AVCapture video frames are landscape-native; with a
+    // portrait .right Vision orientation the image is rotated clockwise.
+    // Vision rectangles have a bottom-left origin. This mapping is independent
+    // of UIImage scale, preview aspect-fill and layer coordinate transforms.
+    private static func lumaPatch(buffer: CVPixelBuffer, visionBox: CGRect) -> [Float]? {
+        guard CVPixelBufferGetPlaneCount(buffer) >= 1 else { return nil }
+        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddressOfPlane(buffer, 0) else { return nil }
+        let rawW = CVPixelBufferGetWidthOfPlane(buffer, 0)
+        let rawH = CVPixelBufferGetHeightOfPlane(buffer, 0)
+        let bytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
+        let luma = base.assumingMemoryBound(to: UInt8.self)
+        let n = 24
+        // Avoid boundary-only samples where feature identity is weak.
+        let inset: CGFloat = 0.12
+        var samples = [Float]()
+        samples.reserveCapacity(n*n)
+        guard visionBox.width > 0.015, visionBox.height > 0.015 else { return nil }
+        for j in 0..<n {
+            for i in 0..<n {
+                let xNorm = visionBox.minX + visionBox.width * (inset + (1 - 2 * inset) * (CGFloat(i) + 0.5) / CGFloat(n))
+                let yNorm = visionBox.maxY - visionBox.height * (inset + (1 - 2 * inset) * (CGFloat(j) + 0.5) / CGFloat(n))
+                // Vision .right: clockwise-rotated image's x,y (top origin)
+                // map to raw landscape buffer (rawX = portraitTopY,
+                // rawY = 1 - portraitX).
+                let rawX = min(rawW - 1, max(0, Int((1 - yNorm) * CGFloat(rawW))))
+                let rawY = min(rawH - 1, max(0, Int((1 - xNorm) * CGFloat(rawH))))
+                samples.append(Float(luma[rawY * bytesPerRow + rawX]) / 255.0)
+            }
+        }
+        return samples
+    }
+
+    private static func variance(_ a: [Float]) -> Float {
+        guard !a.isEmpty else { return 0 }
+        let mean = a.reduce(0, +) / Float(a.count)
+        return a.reduce(Float(0)) { $0 + ($1 - mean) * ($1 - mean) } / Float(a.count)
+    }
+
+    private static func normalizedCorrelation(_ a: [Float], _ b: [Float]) -> Float {
+        guard a.count == b.count, !a.isEmpty else { return -1 }
+        let meanA = a.reduce(0, +) / Float(a.count)
+        let meanB = b.reduce(0, +) / Float(b.count)
+        var dot: Float = 0
+        var normA: Float = 0
+        var normB: Float = 0
+        for i in a.indices {
+            let da = a[i] - meanA, db = b[i] - meanB
+            dot += da * db
+            normA += da * da
+            normB += db * db
+        }
+        guard normA > 0.001, normB > 0.001 else { return -1 }
+        return dot / sqrt(normA * normB)
+    }
+
     private func loseTarget(_ message: String) {
         request = nil
+        pendingSelection = nil
+        referencePatch = nil
+        trackingValidated = false
         baselineArea = 0
         lastAcceptedBox = nil
         stableFrames = 0
@@ -216,7 +293,29 @@ final class CameraTracker: NSObject, ObservableObject {
 extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
-        guard let request, let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        guard let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        let now = CACurrentMediaTime()
+        // Wait for the first actual camera frame before capturing the selected
+        // target's appearance. The selection rect is in Vision coordinates.
+        if let selected = pendingSelection {
+            if let patch = Self.lumaPatch(buffer: buffer, visionBox: selected) {
+                let variance = Self.variance(patch)
+                // Uniform surfaces cannot be matched reliably.
+                if variance < 0.0007 {
+                    loseTarget("選取區域缺少紋理，請框選有細節的物件")
+                } else {
+                    referencePatch = patch
+                    pendingSelection = nil
+                    trackingValidated = true
+                }
+            }
+            return
+        }
+        guard let request, let referencePatch, trackingValidated else { return }
+        // Limit image comparisons and Vision requests to ~12 Hz. Camera
+        // capture/recording itself stays at the normal configured frame rate.
+        guard now - latestSampleTime >= 0.08 else { return }
+        latestSampleTime = now
         do {
             // Back camera, portrait preview. Check orientation on specific devices.
             try sequence.perform([request], on: buffer, orientation: .right)
@@ -231,7 +330,6 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
             }
             confidenceFailures = 0
             let box = observation.boundingBox
-            let now = CACurrentMediaTime()
             let area = box.width * box.height
             guard box.width > 0.025, box.height > 0.025,
                   box.minX >= 0, box.minY >= 0,
@@ -250,6 +348,24 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
                     return
                 }
             }
+            // Require appearance agreement BEFORE accepting the new Vision box.
+            // When drift occurs, do not feed the incorrect box back into Vision.
+            guard let candidate = Self.lumaPatch(buffer: buffer, visionBox: box) else {
+                loseTarget("無法取得目標影像，已停止變焦")
+                return
+            }
+            let similarity = Self.normalizedCorrelation(referencePatch, candidate)
+            guard similarity >= minimumSimilarity else {
+                appearanceFailures += 1
+                approvedZoomFrames = 0
+                stableFrames = 0
+                // No updating inputObservation here: preserve the last valid box.
+                if appearanceFailures >= 2 {
+                    loseTarget("外觀與原始物件不符，已停止變焦，請重新框選")
+                }
+                return
+            }
+            appearanceFailures = 0
             // Smooth size measurement and require consistent observations before zooming.
             let previousArea = smoothedArea ?? area
             let residual = abs(log(max(area, 0.0001) / max(previousArea, 0.0001)))
