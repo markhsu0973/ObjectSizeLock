@@ -1,0 +1,34 @@
+stages:
+  - build
+
+# 手動執行，避免沒有 macOS Runner 時每次 push 都卡住。
+# GitLab.com macOS Hosted Runner 需要符合 GitLab 的使用資格。
+build_ios_ipa:
+  stage: build
+  when: manual
+  allow_failure: true
+  tags:
+    - saas-macos-medium-m1
+  image: macos-15-xcode-16
+  script:
+    - xcodebuild -version
+    - brew install xcodegen
+    - xcodegen generate --spec project.yml
+    - >
+      xcodebuild -project ObjectSizeLock.xcodeproj
+      -scheme ObjectSizeLock
+      -configuration Release
+      -sdk iphoneos
+      -destination 'generic/platform=iOS'
+      -derivedDataPath "$CI_PROJECT_DIR/build"
+      CODE_SIGNING_ALLOWED=NO
+      build
+    - mkdir -p Payload
+    - cp -R build/Build/Products/Release-iphoneos/ObjectSizeLock.app Payload/
+    - zip -qr ObjectSizeLock-unsigned.ipa Payload
+    - test -s ObjectSizeLock-unsigned.ipa
+  artifacts:
+    name: "ObjectSizeLock-iOS-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - ObjectSizeLock-unsigned.ipa
+    expire_in: 30 days
