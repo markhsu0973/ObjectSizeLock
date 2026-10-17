@@ -42,6 +42,14 @@ final class CameraTracker: NSObject, ObservableObject {
     private var trackingValidated = false
     private var latestSampleTime: CFTimeInterval = 0
     private let minimumSimilarity: Float = 0.60
+    // Experimental global re-detection of the original image template.
+    private var isSearching = false
+    private var searchBoxSize = CGSize.zero
+    private var lastSearchAt: CFTimeInterval = 0
+    private var candidateForRecovery: CGRect?
+    private var recoveryHits = 0
+    private var lostSince: CFTimeInterval = 0
+    private let recoveryThreshold: Float = 0.84
 
 
     func start() {
@@ -113,6 +121,10 @@ final class CameraTracker: NSObject, ObservableObject {
             self.sequence = VNSequenceRequestHandler()
             self.pendingSelection = visionBox
             self.referencePatch = nil
+            self.isSearching = false
+            self.candidateForRecovery = nil
+            self.recoveryHits = 0
+            self.searchBoxSize = visionBox.size
             self.trackingValidated = false
             self.appearanceFailures = 0
             self.baselineArea = max(visionBox.width * visionBox.height, 0.0001)
@@ -136,6 +148,9 @@ final class CameraTracker: NSObject, ObservableObject {
             self.request = nil
             self.pendingSelection = nil
             self.referencePatch = nil
+            self.isSearching = false
+            self.candidateForRecovery = nil
+            self.recoveryHits = 0
             self.trackingValidated = false
             self.baselineArea = 0
             self.lastAcceptedBox = nil
@@ -271,20 +286,92 @@ final class CameraTracker: NSObject, ObservableObject {
         return dot / sqrt(normA * normB)
     }
 
+    // Preserve the reference appearance instead of discarding it on loss.
+    // A new target is accepted only after two spatially consistent global hits.
     private func loseTarget(_ message: String) {
+        if !isSearching {
+            isSearching = true
+            lostSince = CACurrentMediaTime()
+            searchBoxSize = (lastAcceptedBox ?? request?.inputObservation.boundingBox ?? .zero).size
+        }
         request = nil
-        pendingSelection = nil
-        referencePatch = nil
         trackingValidated = false
-        baselineArea = 0
-        lastAcceptedBox = nil
         stableFrames = 0
         confidenceFailures = 0
         approvedZoomFrames = 0
-        smoothedArea = nil
+        candidateForRecovery = nil
+        recoveryHits = 0
         DispatchQueue.main.async {
             self.trackingRect = nil
-            self.status = message
+            self.status = "LOST：\(message)。搜尋原物件中（停止自動變焦）"
+        }
+    }
+
+    private func searchForTarget(in buffer: CVPixelBuffer, at now: CFTimeInterval) {
+        guard isSearching, let reference = referencePatch,
+              searchBoxSize.width > 0.025, searchBoxSize.height > 0.025,
+              now - lastSearchAt > 0.65 else { return }
+        lastSearchAt = now
+        // Search the whole image at several scales. This is a conservative,
+        // CPU-only prototype; it is not a trained re-identification network.
+        let scales: [CGFloat] = [0.75, 1.0, 1.25]
+        var bestScore: Float = -1
+        var bestBox: CGRect?
+        for scale in scales {
+            let width = min(0.50, searchBoxSize.width * scale)
+            let height = min(0.50, searchBoxSize.height * scale)
+            guard width >= 0.025, height >= 0.025 else { continue }
+            let strideX = max(0.018, width * 0.35)
+            let strideY = max(0.018, height * 0.35)
+            var y: CGFloat = 0
+            while y <= 1 - height {
+                var x: CGFloat = 0
+                while x <= 1 - width {
+                    let box = CGRect(x: x, y: y, width: width, height: height)
+                    if let patch = Self.lumaPatch(buffer: buffer, visionBox: box),
+                       Self.variance(patch) >= 0.0007 {
+                        let score = Self.normalizedCorrelation(reference, patch)
+                        if score > bestScore { bestScore = score; bestBox = box }
+                    }
+                    x += strideX
+                }
+                y += strideY
+            }
+        }
+        guard bestScore >= recoveryThreshold, let box = bestBox else {
+            candidateForRecovery = nil
+            recoveryHits = 0
+            return
+        }
+        if let prior = candidateForRecovery,
+           hypot(prior.midX - box.midX, prior.midY - box.midY) < 0.08 {
+            recoveryHits += 1
+        } else {
+            recoveryHits = 1
+        }
+        candidateForRecovery = box
+        guard recoveryHits >= 2 else { return }
+        let obs = VNDetectedObjectObservation(boundingBox: box)
+        let newRequest = VNTrackObjectRequest(detectedObjectObservation: obs)
+        newRequest.trackingLevel = .accurate
+        sequence = VNSequenceRequestHandler()
+        request = newRequest
+        isSearching = false
+        trackingValidated = true
+        lastAcceptedBox = box
+        smoothedArea = box.width * box.height
+        zoomSettlingUntil = now + 1.8
+        stableFrames = 0
+        approvedZoomFrames = 0
+        appearanceFailures = 0
+        confidenceFailures = 0
+        candidateForRecovery = nil
+        recoveryHits = 0
+        let meta = CGRect(x: box.minX, y: 1 - box.maxY,
+                          width: box.width, height: box.height)
+        DispatchQueue.main.async {
+            self.trackingRect = meta
+            self.status = "REACQUIRED：已找到候選目標，請確認追蹤框是否正確"
         }
     }
 
@@ -309,6 +396,10 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
                     trackingValidated = true
                 }
             }
+            return
+        }
+        if isSearching {
+            searchForTarget(in: buffer, at: now)
             return
         }
         guard let request, let referencePatch, trackingValidated else { return }
