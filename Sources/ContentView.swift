@@ -39,7 +39,7 @@ struct ContentView: View {
                 .controlSize(.regular)
                 .padding(12)
                 .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 12))
-                Text("v0.9 診斷版：黃＝初始框；粉紅＝Vision 原始框；綠＝接受框。固定 1×，短暫低信心不立即 LOST。")
+                Text("v1.0 實驗版：黃＝初始框；粉紅＝Vision 原始框；綠＝接受框。固定 1×、25Hz 追蹤；短暫 LOST 先做局部恢復，不保證遮擋重辨識。")
                     .font(.caption)
                     .multilineTextAlignment(.center)
                     .padding(.horizontal, 14)

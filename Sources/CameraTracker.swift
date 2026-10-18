@@ -35,8 +35,8 @@ final class CameraTracker: NSObject, ObservableObject {
     private var zoomSettlingUntil: CFTimeInterval = 0
     private var confidenceFailures = 0
     private var uncertainFrames = 0
-    private let rejectAfterFrames = 24
-    private let minimumVisionConfidence: Float = 0.30
+    private let rejectAfterFrames = 36
+    private let minimumVisionConfidence: Float = 0.25
     private let recoveryConfidence: Float = 0.55
     private var lastUncertainNotice: CFTimeInterval = 0
     private var approvedZoomFrames = 0
@@ -56,6 +56,8 @@ final class CameraTracker: NSObject, ObservableObject {
     private var lastVisionConfidence: Float = 0
     private var consecutiveGoodFrames = 0
     private var invalidGeometryFrames = 0
+    private var localRecoveryAttempts = 0
+    private var lastLocalRecoveryAt: CFTimeInterval = 0
     private var previousVisionBox: CGRect?
     // Experimental global re-detection of the original image template.
     private var isSearching = false
@@ -157,6 +159,8 @@ final class CameraTracker: NSObject, ObservableObject {
             self.consecutiveGoodFrames = 0
             self.previousVisionBox = nil
             self.invalidGeometryFrames = 0
+            self.localRecoveryAttempts = 0
+            self.lastLocalRecoveryAt = 0
             self.lastAcceptedTime = CACurrentMediaTime()
             DispatchQueue.main.async {
                 self.trackingRect = metadataRect
@@ -164,7 +168,7 @@ final class CameraTracker: NSObject, ObservableObject {
                 self.selectionRect = metadataRect
                 self.trackingQuality = "INITIALIZING"
                 self.diagnostics = "等待第一幀影像"
-                self.status = "v0.9 診斷：允許暫時不確定；變焦保持關閉"
+                self.status = "v1.0 實驗：高頻 Vision 追蹤與短暫局部恢復；自動 Zoom 關閉"
             }
         }
     }
@@ -188,6 +192,7 @@ final class CameraTracker: NSObject, ObservableObject {
             self.consecutiveGoodFrames = 0
             self.previousVisionBox = nil
             self.invalidGeometryFrames = 0
+            self.localRecoveryAttempts = 0
             DispatchQueue.main.async {
                 self.trackingRect = nil
                 self.rawVisionRect = nil
@@ -204,7 +209,7 @@ final class CameraTracker: NSObject, ObservableObject {
         // is under investigation; restoring zoom requires an explicit patch.
         autoZoom = false
         videoQueue.async { self.zoomEnabled = false }
-        status = "v0.9 診斷版固定 1×；先確認追蹤是否穩定"
+        status = "v1.0 實驗版固定 1×；先確認追蹤是否穩定"
     }
 
     func toggleRecording() {
@@ -324,6 +329,34 @@ final class CameraTracker: NSObject, ObservableObject {
 
     // Preserve the reference appearance instead of discarding it on loss.
     // A new target is accepted only after two spatially consistent global hits.
+    // Re-seed the native tracker only briefly around the LAST TRUSTED region.
+    // This is not global re-identification and never approves a recovered
+    // target as safe for Zoom without several high-confidence observations.
+    private func attemptLocalRecovery(at now: CFTimeInterval) -> Bool {
+        guard localRecoveryAttempts < 2,
+              now - lastLocalRecoveryAt > 0.8,
+              let trusted = lastAcceptedBox,
+              now - lastAcceptedTime < 3.5 else { return false }
+        let obs = VNDetectedObjectObservation(boundingBox: trusted)
+        let fresh = VNTrackObjectRequest(detectedObjectObservation: obs)
+        fresh.trackingLevel = .accurate
+        request = fresh
+        sequence = VNSequenceRequestHandler()
+        localRecoveryAttempts += 1
+        lastLocalRecoveryAt = now
+        confidenceFailures = 0
+        invalidGeometryFrames = 0
+        uncertainFrames = 0
+        consecutiveGoodFrames = 0
+        stableFrames = 0
+        approvedZoomFrames = 0
+        DispatchQueue.main.async {
+            self.trackingQuality = "RECOVERING"
+            self.diagnostics = "嘗試局部恢復（不代表重新辨識成功）"
+        }
+        return true
+    }
+
     private func loseTarget(_ message: String) {
         if !isSearching {
             isSearching = true
@@ -445,9 +478,9 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
             return
         }
         guard let request, let referencePatch, trackingValidated else { return }
-        // Limit image comparisons and Vision requests to ~12 Hz. Camera
+        // Limit Vision tracking to ~25 Hz on the video queue. Camera
         // capture/recording itself stays at the normal configured frame rate.
-        guard now - latestSampleTime >= 0.08 else { return }
+        guard now - latestSampleTime >= 0.04 else { return }
         latestSampleTime = now
         do {
             // Back camera, portrait preview. Check orientation on specific devices.
@@ -456,7 +489,7 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
                 confidenceFailures += 1
                 stableFrames = 0
                 approvedZoomFrames = 0
-                if confidenceFailures >= rejectAfterFrames { loseTarget("Vision 未回傳追蹤結果") }
+                if confidenceFailures >= rejectAfterFrames && !attemptLocalRecovery(at: now) { loseTarget("Vision 未回傳追蹤結果") }
                 return
             }
             // Always advance Vision's state on the next frame, even when a
@@ -488,7 +521,7 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
                         self.diagnostics = String(format: "Vision %.2f | 低信心 %d/%d", observation.confidence, misses, self.rejectAfterFrames)
                     }
                 }
-                if confidenceFailures >= rejectAfterFrames { loseTarget("Vision 信心值持續不足") }
+                if confidenceFailures >= rejectAfterFrames && !attemptLocalRecovery(at: now) { loseTarget("Vision 信心值持續不足") }
                 return
             }
             confidenceFailures = 0
@@ -505,7 +538,7 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
                     self.status = "影像框異常，暫停 Zoom；持續嘗試恢復"
                 }
                 if invalidGeometryFrames >= rejectAfterFrames {
-                    loseTarget("Vision 持續回傳無效框")
+                    if !attemptLocalRecovery(at: now) { loseTarget("Vision 持續回傳無效框") }
                 }
                 return
             }
@@ -535,13 +568,14 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
                         }
                     }
                     previousVisionBox = box
-                    if uncertainFrames >= rejectAfterFrames { loseTarget("Vision 框持續突變") }
+                    if uncertainFrames >= rejectAfterFrames && !attemptLocalRecovery(at: now) { loseTarget("Vision 框持續突變") }
                     return
                 }
             }
             uncertainFrames = 0
             previousVisionBox = box
             consecutiveGoodFrames = observation.confidence >= recoveryConfidence ? consecutiveGoodFrames + 1 : 0
+            if consecutiveGoodFrames >= 12 { localRecoveryAttempts = 0 }
             // Diagnostic v0.8: appearance is measured, NOT used as a hard
             // rejection criterion. Fixed grayscale templates are too sensitive
             // to motion, imperfect boxes and scale variation.
@@ -585,7 +619,7 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
             // The UI toggle stays usable but cannot command lens movement.
 
         } catch {
-            loseTarget("追蹤失敗，已停止變焦，請重新框選")
+            if !attemptLocalRecovery(at: now) { loseTarget("追蹤失敗，已停止變焦，請重新框選") }
         }
     }
 }
