@@ -39,7 +39,7 @@ struct ContentView: View {
                 .controlSize(.regular)
                 .padding(12)
                 .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 12))
-                Text("v0.6 診斷：先保持自動縮放關閉。相似度偏低不會立即 LOST；請錄下追蹤框與數值。")
+                Text("v0.7：黃＝初始框；粉紅＝Vision 原始框；綠＝接受框。先關閉自動 Zoom；LOST 不會猜測重新鎖定。")
                     .font(.caption)
                     .multilineTextAlignment(.center)
                     .padding(.horizontal, 14)
@@ -59,7 +59,11 @@ final class TrackingPreviewView: UIView {
     var previewLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
     private let targetLayer = CAShapeLayer()
     private let selectionLayer = CAShapeLayer()
+    private let rawLayer = CAShapeLayer()
+    private let initialLayer = CAShapeLayer()
     private var target: CGRect?
+    private var rawTarget: CGRect?
+    private var initialTarget: CGRect?
     var onSelection: ((CGRect) -> Void)?
     private var dragStart: CGPoint?
     override init(frame: CGRect) {
@@ -69,6 +73,16 @@ final class TrackingPreviewView: UIView {
         targetLayer.fillColor = UIColor.clear.cgColor
         targetLayer.lineWidth = 2.5
         layer.addSublayer(targetLayer)
+        rawLayer.strokeColor = UIColor.systemPink.cgColor
+        rawLayer.fillColor = UIColor.clear.cgColor
+        rawLayer.lineWidth = 2
+        rawLayer.lineDashPattern = [5, 4]
+        layer.addSublayer(rawLayer)
+        initialLayer.strokeColor = UIColor.systemYellow.cgColor
+        initialLayer.fillColor = UIColor.clear.cgColor
+        initialLayer.lineWidth = 1.5
+        initialLayer.lineDashPattern = [3, 6]
+        layer.addSublayer(initialLayer)
         selectionLayer.strokeColor = UIColor.systemYellow.cgColor
         selectionLayer.fillColor = UIColor.systemYellow.withAlphaComponent(0.12).cgColor
         selectionLayer.lineWidth = 2
@@ -81,16 +95,24 @@ final class TrackingPreviewView: UIView {
         super.layoutSubviews()
         targetLayer.frame = bounds
         selectionLayer.frame = bounds
+        rawLayer.frame = bounds
+        initialLayer.frame = bounds
         redrawTarget()
     }
-    func show(_ normalizedRect: CGRect?) {
+    func show(_ normalizedRect: CGRect?, raw: CGRect?, initial: CGRect?) {
         target = normalizedRect
+        rawTarget = raw
+        initialTarget = initial
         redrawTarget()
     }
     private func redrawTarget() {
-        guard let target else { targetLayer.path = nil; return }
-        let rect = previewLayer.layerRectConverted(fromMetadataOutputRect: target)
-        targetLayer.path = UIBezierPath(rect: rect).cgPath
+        func path(_ rect: CGRect?) -> CGPath? {
+            guard let rect else { return nil }
+            return UIBezierPath(rect: previewLayer.layerRectConverted(fromMetadataOutputRect: rect)).cgPath
+        }
+        targetLayer.path = path(target)
+        rawLayer.path = path(rawTarget)
+        initialLayer.path = path(initialTarget)
     }
     private func pick(_ rect: CGRect) {
         let clipped = rect.intersection(bounds)
@@ -134,7 +156,7 @@ struct CameraPreview: UIViewRepresentable {
         return view
     }
     func updateUIView(_ view: TrackingPreviewView, context: Context) {
-        view.show(camera.trackingRect)
+        view.show(camera.trackingRect, raw: camera.rawVisionRect, initial: camera.selectionRect)
         if let connection = view.previewLayer.connection, connection.isVideoOrientationSupported {
             connection.videoOrientation = .portrait
         }
