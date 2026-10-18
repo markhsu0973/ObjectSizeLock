@@ -11,6 +11,8 @@ final class CameraTracker: NSObject, ObservableObject {
     @Published var trackingRect: CGRect? // metadata coordinates, top-left origin
     @Published var recording = false
     @Published var autoZoom = false
+    @Published var diagnostics = "等待框選"
+    @Published var trackingQuality = "IDLE"
 
     private let sessionQueue = DispatchQueue(label: "size.lock.session")
     private let videoQueue = DispatchQueue(label: "size.lock.tracking", qos: .userInitiated)
@@ -42,6 +44,9 @@ final class CameraTracker: NSObject, ObservableObject {
     private var trackingValidated = false
     private var latestSampleTime: CFTimeInterval = 0
     private let minimumSimilarity: Float = 0.60
+    private var diagnosticFrames = 0
+    private var lastSimilarity: Float = -1
+    private var lastVisionConfidence: Float = 0
     // Experimental global re-detection of the original image template.
     private var isSearching = false
     private var searchBoxSize = CGSize.zero
@@ -138,7 +143,9 @@ final class CameraTracker: NSObject, ObservableObject {
             self.lastAcceptedTime = CACurrentMediaTime()
             DispatchQueue.main.async {
                 self.trackingRect = metadataRect
-                self.status = "追蹤測試中：先確認綠框持續包住物件，再啟用自動縮放"
+                self.trackingQuality = "INITIALIZING"
+                self.diagnostics = "等待第一幀影像"
+                self.status = "v0.6 診斷：觀察 Vision 框；Zoom 預設關閉"
             }
         }
     }
@@ -160,6 +167,8 @@ final class CameraTracker: NSObject, ObservableObject {
             self.smoothedArea = nil
             DispatchQueue.main.async {
                 self.trackingRect = nil
+                self.trackingQuality = "IDLE"
+                self.diagnostics = "等待框選"
                 self.status = "請重新點選或框選物件"
             }
         }
@@ -303,6 +312,8 @@ final class CameraTracker: NSObject, ObservableObject {
         recoveryHits = 0
         DispatchQueue.main.async {
             self.trackingRect = nil
+            self.trackingQuality = "LOST"
+            self.diagnostics = "LOST: \(message)"
             self.status = "LOST：\(message)。搜尋原物件中（停止自動變焦）"
         }
     }
@@ -371,7 +382,8 @@ final class CameraTracker: NSObject, ObservableObject {
                           width: box.width, height: box.height)
         DispatchQueue.main.async {
             self.trackingRect = meta
-            self.status = "REACQUIRED：已找到候選目標，請確認追蹤框是否正確"
+            self.trackingQuality = "REACQUIRED?"
+            self.status = "REACQUIRED 候選：請人工確認綠框是否正確"
         }
     }
 
@@ -394,6 +406,10 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
                     referencePatch = patch
                     pendingSelection = nil
                     trackingValidated = true
+                    DispatchQueue.main.async {
+                        self.trackingQuality = "TRACKING"
+                        self.diagnostics = String(format: "模板方差 %.4f", variance)
+                    }
                 }
             }
             return
@@ -435,33 +451,33 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
                 let centerJump = hypot(box.midX - previous.midX, box.midY - previous.midY)
                 // Reject sudden drift onto the background or a different object.
                 if areaRatio < 0.72 || areaRatio > 1.38 || centerJump > 0.105 {
-                    loseTarget("追蹤位置突變，已停止變焦，請重新框選")
+                    confidenceFailures += 1
+                    if confidenceFailures >= 3 {
+                        loseTarget("追蹤框連續突變")
+                    }
                     return
                 }
             }
-            // Require appearance agreement BEFORE accepting the new Vision box.
-            // When drift occurs, do not feed the incorrect box back into Vision.
-            guard let candidate = Self.lumaPatch(buffer: buffer, visionBox: box) else {
-                loseTarget("無法取得目標影像，已停止變焦")
-                return
-            }
-            let similarity = Self.normalizedCorrelation(referencePatch, candidate)
-            guard similarity >= minimumSimilarity else {
-                appearanceFailures += 1
+            // Diagnostic v0.6: appearance is measured, NOT used as a hard
+            // rejection criterion. Fixed grayscale templates are too sensitive
+            // to motion, imperfect boxes and scale variation.
+            let candidate = Self.lumaPatch(buffer: buffer, visionBox: box)
+            let similarity: Float = candidate.map {
+                Self.normalizedCorrelation(referencePatch, $0)
+            } ?? -1
+            lastSimilarity = similarity
+            lastVisionConfidence = observation.confidence
+            appearanceFailures = similarity < minimumSimilarity ? appearanceFailures + 1 : 0
+            // A low appearance score disables zoom, but Vision tracking keeps
+            // running so we can distinguish tracker drift from false rejection.
+            if similarity < minimumSimilarity {
                 approvedZoomFrames = 0
-                stableFrames = 0
-                // No updating inputObservation here: preserve the last valid box.
-                if appearanceFailures >= 2 {
-                    loseTarget("外觀與原始物件不符，已停止變焦，請重新框選")
-                }
-                return
             }
-            appearanceFailures = 0
             // Smooth size measurement and require consistent observations before zooming.
             let previousArea = smoothedArea ?? area
             let residual = abs(log(max(area, 0.0001) / max(previousArea, 0.0001)))
             smoothedArea = previousArea * 0.82 + area * 0.18
-            if residual < 0.075 { approvedZoomFrames += 1 } else { approvedZoomFrames = 0 }
+            if residual < 0.075 && similarity >= minimumSimilarity { approvedZoomFrames += 1 } else { approvedZoomFrames = 0 }
             request.inputObservation = observation
             lastAcceptedBox = box
             lastAcceptedTime = now
@@ -473,12 +489,16 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
             if now - lastDisplayUpdate >= 0.1 {
                 lastDisplayUpdate = now
                 let currentZoom = camera?.videoZoomFactor ?? 1
+                let failures = appearanceFailures
                 DispatchQueue.main.async {
                     self.trackingRect = metadataBox
                     self.zoom = currentZoom
+                    self.trackingQuality = "TRACKING"
+                    self.diagnostics = String(format: "Vision %.2f | 相似 %.2f | Box (%.2f,%.2f,%.2f,%.2f) | 不符 %d", observation.confidence, similarity, box.minX, box.minY, box.width, box.height, failures)
                 }
             }
-            if zoomEnabled, let filteredArea = smoothedArea { updateZoom(measuredArea: filteredArea, now: now) }
+            if zoomEnabled, similarity >= minimumSimilarity,
+               let filteredArea = smoothedArea { updateZoom(measuredArea: filteredArea, now: now) }
         } catch {
             loseTarget("追蹤失敗，已停止變焦，請重新框選")
         }

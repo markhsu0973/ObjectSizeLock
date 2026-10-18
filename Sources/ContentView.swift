@@ -16,6 +16,14 @@ struct ContentView: View {
                 }
                 .padding(12)
                 .background(.black.opacity(0.65), in: RoundedRectangle(cornerRadius: 12))
+                HStack(spacing: 8) {
+                    Text("追蹤：" + camera.trackingQuality).font(.caption).bold()
+                    Text(camera.diagnostics).font(.system(size: 10, design: .monospaced))
+                        .lineLimit(3).minimumScaleFactor(0.75)
+                }
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 8))
                 Spacer()
                 HStack(spacing: 12) {
                     Button("重新選取") { camera.resetTracking() }
@@ -31,7 +39,7 @@ struct ContentView: View {
                 .controlSize(.regular)
                 .padding(12)
                 .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 12))
-                Text("請拖曳框選整個物件（不要包含手或背景）。先觀察綠框是否穩定，再開啟自動縮放。")
+                Text("v0.6 診斷：先保持自動縮放關閉。相似度偏低不會立即 LOST；請錄下追蹤框與數值。")
                     .font(.caption)
                     .multilineTextAlignment(.center)
                     .padding(.horizontal, 14)
