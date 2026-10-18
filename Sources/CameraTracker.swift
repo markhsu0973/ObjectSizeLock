@@ -35,9 +35,9 @@ final class CameraTracker: NSObject, ObservableObject {
     private var zoomSettlingUntil: CFTimeInterval = 0
     private var confidenceFailures = 0
     private var uncertainFrames = 0
-    private let rejectAfterFrames = 18
-    private let minimumVisionConfidence: Float = 0.45
-    private let recoveryConfidence: Float = 0.65
+    private let rejectAfterFrames = 24
+    private let minimumVisionConfidence: Float = 0.30
+    private let recoveryConfidence: Float = 0.55
     private var lastUncertainNotice: CFTimeInterval = 0
     private var approvedZoomFrames = 0
     private var smoothedArea: CGFloat?
@@ -55,6 +55,7 @@ final class CameraTracker: NSObject, ObservableObject {
     private var lastSimilarity: Float = -1
     private var lastVisionConfidence: Float = 0
     private var consecutiveGoodFrames = 0
+    private var invalidGeometryFrames = 0
     private var previousVisionBox: CGRect?
     // Experimental global re-detection of the original image template.
     private var isSearching = false
@@ -155,6 +156,7 @@ final class CameraTracker: NSObject, ObservableObject {
             self.uncertainFrames = 0
             self.consecutiveGoodFrames = 0
             self.previousVisionBox = nil
+            self.invalidGeometryFrames = 0
             self.lastAcceptedTime = CACurrentMediaTime()
             DispatchQueue.main.async {
                 self.trackingRect = metadataRect
@@ -162,7 +164,7 @@ final class CameraTracker: NSObject, ObservableObject {
                 self.selectionRect = metadataRect
                 self.trackingQuality = "INITIALIZING"
                 self.diagnostics = "等待第一幀影像"
-                self.status = "v0.8 診斷：Vision 連續更新；自動變焦暫停"
+                self.status = "v0.9 診斷：允許暫時不確定；變焦保持關閉"
             }
         }
     }
@@ -185,6 +187,7 @@ final class CameraTracker: NSObject, ObservableObject {
             self.uncertainFrames = 0
             self.consecutiveGoodFrames = 0
             self.previousVisionBox = nil
+            self.invalidGeometryFrames = 0
             DispatchQueue.main.async {
                 self.trackingRect = nil
                 self.rawVisionRect = nil
@@ -201,7 +204,7 @@ final class CameraTracker: NSObject, ObservableObject {
         // is under investigation; restoring zoom requires an explicit patch.
         autoZoom = false
         videoQueue.async { self.zoomEnabled = false }
-        status = "v0.8 診斷版固定 1×；先確認追蹤框連續性"
+        status = "v0.9 診斷版固定 1×；先確認追蹤是否穩定"
     }
 
     func toggleRecording() {
@@ -425,16 +428,12 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
             if let patch = Self.lumaPatch(buffer: buffer, visionBox: selected) {
                 let variance = Self.variance(patch)
                 // Uniform surfaces cannot be matched reliably.
-                if variance < 0.0007 {
-                    loseTarget("選取區域缺少紋理，請框選有細節的物件")
-                } else {
-                    referencePatch = patch
-                    pendingSelection = nil
-                    trackingValidated = true
-                    DispatchQueue.main.async {
-                        self.trackingQuality = "TRACKING"
-                        self.diagnostics = String(format: "模板方差 %.4f", variance)
-                    }
+                referencePatch = patch
+                pendingSelection = nil
+                trackingValidated = true
+                DispatchQueue.main.async {
+                    self.trackingQuality = "INITIALIZING"
+                    self.diagnostics = String(format: "參考區域方差 %.4f（僅診斷）", variance)
                 }
             }
             return
@@ -466,6 +465,17 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
             // decisions accumulate while the real target keeps moving.
             request.inputObservation = observation
             lastVisionConfidence = observation.confidence
+            let candidateBox = observation.boundingBox
+            let geometryOK = candidateBox.width.isFinite && candidateBox.height.isFinite &&
+                candidateBox.minX.isFinite && candidateBox.minY.isFinite &&
+                candidateBox.width > 0.008 && candidateBox.height > 0.008 &&
+                candidateBox.minX >= 0 && candidateBox.minY >= 0 &&
+                candidateBox.maxX <= 1 && candidateBox.maxY <= 1
+            if geometryOK {
+                let rawRect = CGRect(x: candidateBox.minX, y: 1 - candidateBox.maxY,
+                                     width: candidateBox.width, height: candidateBox.height)
+                DispatchQueue.main.async { self.rawVisionRect = rawRect }
+            }
             if observation.confidence < minimumVisionConfidence {
                 confidenceFailures += 1
                 consecutiveGoodFrames = 0
@@ -483,22 +493,24 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
             }
             confidenceFailures = 0
             let box = observation.boundingBox
-            let rawMetadata = CGRect(x: box.minX, y: 1 - box.maxY,
-                                     width: box.width, height: box.height)
-            // Raw box always visible (magenta), even if quality gates reject it.
-            DispatchQueue.main.async { self.rawVisionRect = rawMetadata }
             let area = box.width * box.height
-            guard box.width > 0.025, box.height > 0.025,
-                  box.minX >= 0, box.minY >= 0,
-                  box.maxX <= 1, box.maxY <= 1,
-                  area.isFinite else {
-                loseTarget("追蹤框異常，已停止變焦，請重新框選")
+            guard geometryOK && area.isFinite else {
+                invalidGeometryFrames += 1
+                stableFrames = 0
+                approvedZoomFrames = 0
+                let failures = invalidGeometryFrames
+                DispatchQueue.main.async {
+                    self.trackingQuality = "UNCERTAIN"
+                    self.diagnostics = "框幾何異常：\(failures)/\(self.rejectAfterFrames)"
+                    self.status = "影像框異常，暫停 Zoom；持續嘗試恢復"
+                }
+                if invalidGeometryFrames >= rejectAfterFrames {
+                    loseTarget("Vision 持續回傳無效框")
+                }
                 return
             }
+            invalidGeometryFrames = 0
             if let previous = lastAcceptedBox {
-                let oldArea = previous.width * previous.height
-                let areaRatio = area / max(oldArea, 0.0001)
-                let centerJump = hypot(box.midX - previous.midX, box.midY - previous.midY)
                 // Reject sudden drift onto the background or a different object.
                 // Judge movement relative to the *previous Vision result*,
                 // rather than the last accepted frame that may be seconds old.
@@ -507,7 +519,7 @@ extension CameraTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
                 let recent = previousVisionBox ?? previous
                 let frameJump = hypot(box.midX - recent.midX, box.midY - recent.midY)
                 let frameAreaRatio = area / max(recent.width * recent.height, 0.0001)
-                if frameAreaRatio < 0.50 || frameAreaRatio > 2.0 || frameJump > 0.20 {
+                if frameAreaRatio < 0.35 || frameAreaRatio > 2.85 || frameJump > 0.30 {
                     uncertainFrames += 1
                     approvedZoomFrames = 0
                     stableFrames = 0
