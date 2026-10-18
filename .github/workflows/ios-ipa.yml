@@ -8,9 +8,20 @@ permissions:
 jobs:
   build:
     runs-on: macos-15
-    timeout-minutes: 25
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
+      - name: Download Core ML model from project release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/model" Sources/Models
+          gh release download v1.1-model \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern 'ostrack_vitb384.mlpackage.zip' \
+            --dir "$RUNNER_TEMP/model"
+          unzip -q "$RUNNER_TEMP/model/ostrack_vitb384.mlpackage.zip" -d Sources/Models
+          test -f Sources/Models/ostrack_vitb384.mlpackage/Manifest.json
       - name: Install XcodeGen
         run: brew install xcodegen
       - name: Generate Xcode project
@@ -22,10 +33,12 @@ jobs:
             -sdk iphoneos -destination 'generic/platform=iOS' \
             -derivedDataPath "$RUNNER_TEMP/build" \
             CODE_SIGNING_ALLOWED=NO build
-      - name: Pack unsigned IPA (requires local signing to install)
+      - name: Check bundled model and pack unsigned IPA
         run: |
+          APP="$RUNNER_TEMP/build/Build/Products/Release-iphoneos/ObjectSizeLock.app"
+          test -d "$APP/ostrack_vitb384.mlmodelc" || { echo 'Missing compiled Core ML model'; exit 1; }
           mkdir -p Payload
-          cp -R "$RUNNER_TEMP/build/Build/Products/Release-iphoneos/ObjectSizeLock.app" Payload/
+          cp -R "$APP" Payload/
           zip -q -r ObjectSizeLock-unsigned.ipa Payload
       - uses: actions/upload-artifact@v4
         with:

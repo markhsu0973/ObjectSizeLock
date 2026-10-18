@@ -4,6 +4,7 @@ import UIKit
 
 struct ContentView: View {
     @StateObject private var camera = CameraTracker()
+    @State private var showCoreMLBenchmark = false
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
@@ -24,6 +25,9 @@ struct ContentView: View {
                 .padding(8)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 8))
+                Button("OSTrack Core ML 效能測試") { showCoreMLBenchmark = true }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.indigo)
                 Spacer()
                 HStack(spacing: 12) {
                     Button("重新選取") { camera.resetTracking() }
@@ -48,6 +52,9 @@ struct ContentView: View {
             .foregroundStyle(.white)
             .padding(.horizontal, 12)
             .padding(.top, 18)
+        }
+        .sheet(isPresented: $showCoreMLBenchmark) {
+            OSTrackBenchmarkView()
         }
         .onAppear { camera.start() }
         .onDisappear { camera.stop() }
